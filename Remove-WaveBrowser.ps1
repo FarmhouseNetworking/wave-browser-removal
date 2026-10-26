@@ -511,7 +511,10 @@ function Enable-DefenderPUA {
         Write-Log 'Defender PUA protection enabled'
     } catch {
         # Normal when a third-party AV is primary, or Tamper Protection / GPO / Intune owns the setting
-        $script:Warnings.Add("Defender PUA protection not set: $($_.Exception.Message)")
+        $msg = $_.Exception.Message
+        if ($msg -match '0x800106ba') { $msg = 'Defender service is not running (another antivirus is probably active - enable PUA blocking there)' }
+        elseif ($msg -match '0x80070005|denied') { $msg = 'access denied (Tamper Protection or a GPO/Intune policy controls this setting)' }
+        $script:Warnings.Add("Defender PUA protection not set: $msg")
     }
 }
 
@@ -564,9 +567,16 @@ Write-Log "Settings: Operation=$RunMode IFEO=$UseIfeo FolderLock=$UseFolderLock 
 foreach ($w in $SettingsWarnings) { $script:Warnings.Add($w) }
 if ($Is32On64) { $script:Warnings.Add('Running in 32-bit PowerShell and could not relaunch 64-bit - HKLM writes went to WOW6432Node') }
 
-$profiles = @(Get-ChildItem $ProfileListKey -ErrorAction SilentlyContinue | ForEach-Object {
-        [pscustomobject]@{ Sid = $_.PSChildName; Path = (Get-ItemProperty $_.PSPath).ProfileImagePath }
-    } | Where-Object { $_.Sid -match '^S-1-5-21-' -and $_.Path -and (Test-Path -LiteralPath $_.Path) })
+# User SIDs: S-1-5-21-* = local / AD domain / Microsoft account, S-1-12-1-* = Entra ID (Azure AD)
+$UserSidPattern = '^S-1-5-21-|^S-1-12-1-'
+$allProfiles = @(Get-ChildItem $ProfileListKey -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{ Sid = $_.PSChildName; Path = [string](Get-ItemProperty $_.PSPath).ProfileImagePath }
+    } | Where-Object { $_.Path -and (Test-Path -LiteralPath $_.Path) })
+$profiles = @($allProfiles | Where-Object { $_.Sid -match $UserSidPattern })
+# Anything that is neither a user SID nor a built-in service account would be silently skipped - say so
+foreach ($o in $allProfiles | Where-Object { $_.Sid -notmatch $UserSidPattern -and $_.Sid -notmatch '^S-1-5-(18|19|20)$' }) {
+    $script:Warnings.Add("Profile $($o.Path) has an unrecognised SID type ($($o.Sid)) - registry and folder locks skipped")
+}
 
 # --- Unblock mode ---------------------------------------------------------------------------
 if ($RunMode -eq 'Unblock') {
@@ -607,6 +617,21 @@ Get-WaveTasks | ForEach-Object {
 # Orphaned task XML files that Task Scheduler no longer lists
 Get-ChildItem $TasksDir -Recurse -File -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -match $Pattern -and $_.Name -ne $EnforceTaskName } | ForEach-Object { Remove-Target $_.FullName }
+# Task folders Wave creates per user (e.g. \Wavesor Software_<SID>\), now empty
+try {
+    $sched = New-Object -ComObject Schedule.Service
+    $sched.Connect()
+    $rootFolder = $sched.GetFolder('\')
+    foreach ($f in @($rootFolder.GetFolders(0))) {
+        if ($f.Name -notmatch $Pattern) { continue }
+        if ($f.GetTasks(1).Count -eq 0 -and $f.GetFolders(0).Count -eq 0) {
+            try { $rootFolder.DeleteFolder($f.Name, 0); $script:Removed++; Write-Log "Removed task folder \$($f.Name)" }
+            catch { $script:Failed.Add("Task folder \$($f.Name)"); Write-Log "FAILED to remove task folder \$($f.Name): $($_.Exception.Message)" }
+        } else {
+            $script:Failed.Add("Task folder \$($f.Name)"); Write-Log "Task folder \$($f.Name) still contains tasks"
+        }
+    }
+} catch { $script:Warnings.Add("Could not enumerate task folders: $($_.Exception.Message)") }
 
 # --- Services: match on name or binary path
 Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
@@ -732,6 +757,17 @@ foreach ($p in $profiles) {
         $i = Get-Item -LiteralPath $run
         foreach ($n in $i.GetValueNames()) { if ($n -match $Pattern -or [string]$i.GetValue($n) -match $Pattern) { $left.Add("Run value: $run :: $n") } }
         $i.Close()
+    }
+    # Only hives that are still loaded (logged-on users) can be checked here
+    $sw = "Registry::HKEY_USERS\$($p.Sid)\Software"
+    if (Test-Path -LiteralPath $sw) {
+        foreach ($k in 'Wavesor','WaveBrowser','WebNavigatorBrowser') {
+            if (Test-Path -LiteralPath "$sw\$k") { $left.Add("Registry key: $sw\$k") }
+        }
+        Get-ChildItem -LiteralPath "$sw\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match $Pattern } | ForEach-Object { $left.Add("Uninstall entry: $($_.Name)") }
+        Get-ChildItem -LiteralPath "$sw\Clients\StartMenuInternet" -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match $Pattern } | ForEach-Object { $left.Add("Browser registration: $($_.Name)") }
     }
 }
 foreach ($f in $script:Failed) { if (-not ($left | Where-Object { $_ -like "*$f" })) { $left.Add("Not removed: $f") } }

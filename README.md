@@ -6,7 +6,7 @@ It is built to run from SuperOps as SYSTEM. It also works from any RMM, or from 
 
 ## What it does
 
-**Removal.** This covers every profile, including users who are not logged on. Their registry hives are loaded temporarily for the cleanup.
+**Removal.** This covers every profile (local, AD domain and Entra ID accounts), including users who are not logged on. Their registry hives are loaded temporarily for the cleanup.
 
 - Kills Wave, SWUpdater and WebNavigator processes.
 - Removes their scheduled tasks (including orphaned task XML files) and their services.
