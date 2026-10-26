@@ -464,11 +464,47 @@ function Remove-IfeoBlocks {
     }
 }
 
+# Antivirus products often hold the hosts file open while scanning or protecting it, which makes
+# Get-Content / Set-Content fail with "Stream was not readable". Read with full sharing and
+# retry writes for a few seconds instead.
+function Read-HostsLines {
+    $last = $null
+    for ($i = 0; $i -lt 6; $i++) {
+        try {
+            $fs = [IO.File]::Open($HostsFile, 'Open', 'Read', 'ReadWrite, Delete')
+            try {
+                $sr = New-Object IO.StreamReader($fs)
+                $text = $sr.ReadToEnd(); $sr.Close()
+            } finally { $fs.Close() }
+            return , @($text -split "\r?\n")
+        } catch { $last = $_.Exception; Start-Sleep -Seconds 2 }
+    }
+    throw "hosts file could not be read (locked by antivirus?): $($last.Message)"
+}
+
+function Write-HostsLines([string[]]$Lines) {
+    $item = Get-Item -LiteralPath $HostsFile -Force -ErrorAction Stop
+    $wasReadOnly = $item.IsReadOnly
+    if ($wasReadOnly) { $item.IsReadOnly = $false }
+    $last = $null
+    try {
+        for ($i = 0; $i -lt 6; $i++) {
+            try {
+                [IO.File]::WriteAllText($HostsFile, (($Lines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
+                return
+            } catch { $last = $_.Exception; Start-Sleep -Seconds 2 }
+        }
+        throw "hosts file could not be written (antivirus hosts-file protection?): $($last.Message)"
+    } finally {
+        if ($wasReadOnly) { (Get-Item -LiteralPath $HostsFile -Force).IsReadOnly = $true }
+    }
+}
+
 # Returns the hosts file lines minus our managed block. Does not log.
 function Get-HostsWithoutBlock {
     $out = New-Object System.Collections.Generic.List[string]
     $in = $false
-    foreach ($l in @(Get-Content -LiteralPath $HostsFile -ErrorAction Stop)) {
+    foreach ($l in (Read-HostsLines)) {
         if ($l -eq $HostsBeginMarker) { $in = $true; continue }
         if ($l -eq $HostsEndMarker)   { $in = $false; continue }
         if (-not $in) { $out.Add($l) }
@@ -479,7 +515,7 @@ function Get-HostsWithoutBlock {
 
 function Save-Hosts($Lines) {
     Copy-Item -LiteralPath $HostsFile -Destination (Join-Path $WorkDir 'hosts.bak') -Force -ErrorAction SilentlyContinue
-    Set-Content -LiteralPath $HostsFile -Value $Lines -Encoding ASCII -Force -ErrorAction Stop
+    Write-HostsLines $Lines
     & ipconfig.exe /flushdns | Out-Null
 }
 
@@ -489,6 +525,13 @@ function Set-HostsBlock {
         $lines.Add(''); $lines.Add($HostsBeginMarker)
         foreach ($d in $BlockedDomains) { $lines.Add("0.0.0.0 $d") }
         $lines.Add($HostsEndMarker)
+        # Only touch the file when the block is missing or out of date
+        $current = @(Read-HostsLines)
+        while ($current.Count -and [string]::IsNullOrWhiteSpace($current[-1])) { $current = @($current[0..($current.Count - 2)]) }
+        if (($current -join "`n") -ceq ($lines -join "`n")) {
+            Write-Log 'Hosts file: Wave block already in place'
+            return
+        }
         Save-Hosts $lines
         Write-Log "Hosts file: sinkholed $($BlockedDomains.Count) Wave domains"
     } catch {
@@ -788,8 +831,12 @@ if ($UseFolderLock) {
         }
     } }
 }
-if ($UseHosts -and -not (Select-String -LiteralPath $HostsFile -SimpleMatch $HostsBeginMarker -Quiet -ErrorAction SilentlyContinue)) {
-    $script:BlockFailed.Add('Hosts block missing')
+if ($UseHosts -and -not ($script:BlockFailed | Where-Object { $_ -like 'Hosts file:*' })) {
+    try {
+        if ((Read-HostsLines) -notcontains $HostsBeginMarker) {
+            $script:BlockFailed.Add('Hosts block missing after writing it - antivirus hosts-file protection may be reverting changes')
+        }
+    } catch { $script:BlockFailed.Add("Hosts block not verified: $($_.Exception.Message)") }
 }
 
 Write-Log "Items removed: $($script:Removed)"
